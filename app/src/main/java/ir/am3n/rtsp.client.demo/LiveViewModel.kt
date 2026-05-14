@@ -13,7 +13,7 @@ class LiveViewModel : ViewModel() {
     companion object {
         private const val TAG: String = "LiveViewModel"
         private const val RTSP_REQUEST_KEY = "rtsp_request"
-        private const val DEFAULT_RTSP_REQUEST = "rtsp://192.168.1.2:554/11"
+        private const val DEFAULT_RTSP_REQUEST = "rtsp://192.168.1.100:8554/live"
         private const val LIVE_PARAMS_FILENAME = "live_params"
     }
 

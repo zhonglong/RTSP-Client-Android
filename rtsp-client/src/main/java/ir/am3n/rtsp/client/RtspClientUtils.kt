@@ -6,6 +6,7 @@ import android.util.Log
 import android.util.Pair
 import ir.am3n.rtsp.client.data.ApplicationTrack
 import ir.am3n.rtsp.client.data.AudioTrack
+import ir.am3n.rtsp.client.data.RtpHeader
 import ir.am3n.rtsp.client.data.SdpInfo
 import ir.am3n.rtsp.client.data.Track
 import ir.am3n.rtsp.client.data.VideoTrack
@@ -15,15 +16,18 @@ import ir.am3n.rtsp.client.interfaces.RtspClientListener
 import ir.am3n.rtsp.client.parser.AacParser
 import ir.am3n.rtsp.client.parser.RtpParser
 import ir.am3n.rtsp.client.parser.VideoRtpParser
-import ir.am3n.utils.NetUtils
 import ir.am3n.utils.VideoCodecUtils
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.math.BigInteger
+import java.net.DatagramPacket
+import java.net.InetAddress
+import java.net.MulticastSocket
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.*
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 
 
@@ -54,6 +58,9 @@ internal object RtspClientUtils {
 
     // Size of buffer for reading from the connection
     internal const val MAX_LINE_SIZE = 4098
+
+    private const val MTU = 1500
+    private const val Q = 1 shl 16
 
     internal fun getAudioCodecName(codec: Int): String {
         return when (codec) {
@@ -107,121 +114,86 @@ internal object RtspClientUtils {
         keepAliveListener: RtspClientKeepAliveListener
     ) {
 
-        var data = EMPTY_ARRAY // Usually not bigger than MTU = 15KB
+        var count = 0
         val videoParser: VideoRtpParser? =
             if (sdpInfo.videoTrack != null) {
+                count++
                 when (sdpInfo.videoTrack!!.videoCodec) {
                     VIDEO_CODEC_H264 -> VideoRtpParser()
                     VIDEO_CODEC_H265 -> VideoRtpParser()
                     else -> null
                 }
             } else null
-        val audioParser = if (sdpInfo.audioTrack?.audioCodec == AUDIO_CODEC_AAC) AacParser(sdpInfo.audioTrack!!.mode!!) else null
+        val audioParser =
+            if (sdpInfo.audioTrack != null) {
+                count++
+                if (sdpInfo.audioTrack?.audioCodec == AUDIO_CODEC_AAC) AacParser(sdpInfo.audioTrack!!.mode!!) else null
+            } else null
 
-        var nalUnitSps = if (sdpInfo.videoTrack != null) sdpInfo.videoTrack!!.sps else null
-        var nalUnitPps = if (sdpInfo.videoTrack != null) sdpInfo.videoTrack!!.pps else null
-        var nalUnitSei: ByteArray = EMPTY_ARRAY
-        var videoSeqNum = 0
+        if (!exitFlag.get()) {
+            val cdl = CountDownLatch(count)
+            // Audio
+            if (sdpInfo.videoTrack != null) {
+                Thread({
+                    var videoSeqNum = 0
 
-        var keepAliveSent = System.currentTimeMillis()
+                    val socket = MulticastSocket(sdpInfo.videoTrack!!.port)
+                    socket.receiveBufferSize = 1024 * 1024
+                    val group = InetAddress.getByName(sdpInfo.videoTrack!!.host)
+                    socket.joinGroup(group)
 
-        while (!exitFlag.get()) {
+                    val data = ByteArray(MTU) // Usually not bigger than MTU = 15KB
+                    val buffer = ByteArray(MTU)
+                    val packet = DatagramPacket(buffer, buffer.size)
 
-            //if (Rtsp.DEBUG) Log.d(TAG, "readRdpData() > readHeader()")
-            val header = RtpParser.readHeader(inputStream)
-                ?: throw IOException("No RTP frame header found")
+                    while (!exitFlag.get()) {
+                        socket.receive(packet)
 
-            if (header.payloadSize > data.size) {
-                data = ByteArray(header.payloadSize)
-            }
-
-            if (Rtsp.DEBUG) Log.d(TAG, "readRdpData() > readData()  header payload size ${header.payloadSize}")
-            val totalReadBytes = NetUtils.readData(inputStream, data, offset = 0, header.payloadSize)
-            if (Rtsp.DEBUG) Log.d(TAG, "readRdpData() > readData()  total read bytes: $totalReadBytes")
-
-            // Check if keep-alive should be sent
-            val l = System.currentTimeMillis()
-            if (keepAliveTimeout > 0 && l - keepAliveSent > keepAliveTimeout) {
-                keepAliveSent = l
-                keepAliveListener.onRtspKeepAliveRequested()
-            }
-
-            // Video
-            if (header.payloadType == sdpInfo.videoTrack?.payloadType) {
-                if (videoSeqNum > header.sequenceNumber)
-                    Log.w(RtspClient.TAG, "Invalid video seq num " + videoSeqNum + "/" + header.sequenceNumber)
-                videoSeqNum = header.sequenceNumber
-                val nalUnit = videoParser?.processRtpPacketAndGetNalUnit(data, header.payloadSize)
-                if (nalUnit != null) {
-                    val type: Byte = VideoCodecUtils.getH264NalUnitType(nalUnit, 0, nalUnit.size)
-                    when (type) {
-                        VideoCodecUtils.NAL_SPS -> {
-                            nalUnitSps = nalUnit
-                            // Looks like there is NAL_IDR_SLICE as well. Send it now.
-                            if (nalUnit.size > 100) {
+                        val header = RtpHeader.parseData(buffer, packet.length)!!
+                        System.arraycopy(buffer, RtpParser.RTP_HEADER_SIZE, data, 0, header.payloadSize)
+                        if (header.payloadType == sdpInfo.videoTrack?.payloadType) {
+                            if ((Q + header.sequenceNumber - videoSeqNum) % Q != 1)
+                                Log.w(RtspClient.TAG, "Invalid video seq num " + videoSeqNum + "/" + header.sequenceNumber)
+                            videoSeqNum = header.sequenceNumber
+                            val nalUnit = videoParser?.processRtpPacketAndGetNalUnit(data, header.payloadSize)
+                            if (nalUnit != null) {
                                 listener.onRtspVideoNalUnitReceived(nalUnit, 0, nalUnit.size, (header.timeStamp * 11.111111).toLong())
-                            }
-                        }
-                        VideoCodecUtils.NAL_PPS -> {
-                            nalUnitPps = nalUnit
-                            // Looks like there is NAL_IDR_SLICE as well. Send it now.
-                            if (nalUnit.size > 100) {
-                                listener.onRtspVideoNalUnitReceived(nalUnit, 0, nalUnit.size, (header.timeStamp * 11.111111).toLong())
-                            }
-                        }
-                        VideoCodecUtils.NAL_SEI -> {
-                            nalUnitSei = nalUnit
-                        }
-                        VideoCodecUtils.NAL_IDR_SLICE -> {
-                            // Combine IDR with SPS/PPS
-                            if (nalUnitSps != null && nalUnitPps != null) {
-                                val nalUnitSppPpsIdr = ByteArray(nalUnitSps.size + nalUnitPps.size + nalUnitSei.size + nalUnit.size)
-                                System.arraycopy(nalUnitSps, 0, nalUnitSppPpsIdr, 0, nalUnitSps.size)
-                                System.arraycopy(nalUnitPps, 0, nalUnitSppPpsIdr, nalUnitSps.size, nalUnitPps.size)
-                                System.arraycopy(nalUnitSei, 0, nalUnitSppPpsIdr, nalUnitSps.size + nalUnitPps.size, nalUnitSei.size)
-                                System.arraycopy(
-                                    nalUnit, 0, nalUnitSppPpsIdr, nalUnitSps.size + nalUnitPps.size + nalUnitSei.size, nalUnit.size
-                                )
-                                listener.onRtspVideoNalUnitReceived(
-                                    nalUnitSppPpsIdr, 0, nalUnitSppPpsIdr.size,
-                                    (header.timeStamp * 11.111111).toLong()
-                                )
-                                nalUnitSps = null
-                                nalUnitPps = null
-                                nalUnitSei = EMPTY_ARRAY
-                            }
-                        }
-                        else -> {
-                            if (nalUnitSei.isEmpty()) {
-                                listener.onRtspVideoNalUnitReceived(nalUnit, 0, nalUnit.size, (header.timeStamp * 11.111111).toLong())
-                            } else {
-                                val nalUnitSeiSlice = ByteArray(nalUnitSei.size + nalUnit.size)
-                                System.arraycopy(nalUnitSei, 0, nalUnitSeiSlice, 0, nalUnitSei.size)
-                                System.arraycopy(nalUnit, 0, nalUnitSeiSlice, nalUnitSei.size, nalUnit.size)
-                                listener.onRtspVideoNalUnitReceived(
-                                    nalUnitSeiSlice,
-                                    0,
-                                    nalUnitSeiSlice.size,
-                                    (header.timeStamp * 11.111111).toLong()
-                                )
-                                nalUnitSei = EMPTY_ARRAY
                             }
                         }
                     }
-                }
-
-                // Audio
-            } else if (header.payloadType == sdpInfo.audioTrack?.payloadType) {
-                val sample = audioParser?.processRtpPacketAndGetSample(data, header.payloadSize)
-                if (sample != null) {
-                    listener.onRtspAudioSampleReceived(sample, offset = 0, sample.size, (header.timeStamp * 11.111111).toLong())
-                }
-
-                // Unknown
-            } else {
-                // https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml
-                if (Rtsp.DEBUG) Log.w(TAG, "Invalid RTP payload type " + header.payloadType)
+                    socket.close()
+                    cdl.countDown()
+                }).start()
             }
+
+            // Audio
+            if (sdpInfo.audioTrack != null) {
+                Thread({
+                    val socket = MulticastSocket(sdpInfo.audioTrack!!.port)
+                    val group = InetAddress.getByName(sdpInfo.audioTrack!!.host)
+                    socket.joinGroup(group)
+
+                    val data = ByteArray(MTU) // Usually not bigger than MTU = 15KB
+                    val buffer = ByteArray(MTU)
+                    val packet = DatagramPacket(buffer, buffer.size)
+
+                    while (!exitFlag.get()) {
+                        socket.receive(packet)
+
+                        val header = RtpHeader.parseData(buffer, packet.length)!!
+                        System.arraycopy(buffer, RtpParser.RTP_HEADER_SIZE, data, 0, header.payloadSize)
+                        if (header.payloadType == sdpInfo.audioTrack?.payloadType) {
+                            val sample = audioParser?.processRtpPacketAndGetSample(data, header.payloadSize)
+                            if (sample != null) {
+                                listener.onRtspAudioSampleReceived(sample, offset = 0, sample.size, (header.timeStamp * 11.111111).toLong())
+                            }
+                        }
+                    }
+                    socket.close()
+                    cdl.countDown()
+                }).start()
+            }
+            cdl.await()
         }
     }
 
@@ -359,15 +331,23 @@ internal object RtspClientUtils {
     private fun getTracksFromDescribeParams(params: List<Pair<String, String>>): Array<Track?> {
         val tracks = arrayOfNulls<Track>(3)
         var currentTrack: Track? = null
+        var ip: String? = null
         for (param in params) {
             when (param.first) {
+                "c" -> {
+                    // parse udp multicast IP4, video and audio are same
+                    val values = TextUtils.split(param.second, " ")
+                    ip = if (values.size > 2) values[2] else null
+                }
                 "m" -> {
                     if (param.second.startsWith("video")) {
                         currentTrack = VideoTrack()
                         tracks[0] = currentTrack
+                        currentTrack.host = ip
                     } else if (param.second.startsWith("audio")) {
                         currentTrack = AudioTrack()
                         tracks[1] = currentTrack
+                        currentTrack.host = ip
                     } else if (param.second.startsWith("application")) {
                         currentTrack = ApplicationTrack()
                         tracks[2] = currentTrack
@@ -376,6 +356,8 @@ internal object RtspClientUtils {
                     }
                     if (currentTrack != null) {
                         val values = TextUtils.split(param.second, " ")
+                        // parse udp multicast port, video and audio are different
+                        currentTrack.port = if (values.size > 1) values[1].toInt() else -1
                         currentTrack.payloadType = if (values.size > 3) values[3].toInt() else -1
                         if (currentTrack.payloadType == -1) Log.e(TAG, "Failed to get payload type from \"m=" + param.second + "\"")
                     }

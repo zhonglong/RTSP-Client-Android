@@ -39,7 +39,7 @@ class Rtsp {
         private const val TAG: String = "Rtsp"
         private const val DEFAULT_RTSP_PORT = 554
 
-        var DEBUG = true
+        var DEBUG = false
 
         suspend fun isOnline(url: String, username: String? = null, password: String? = null, userAgent: String? = null): Boolean {
             return suspendCoroutine {
@@ -375,7 +375,7 @@ class Rtsp {
             surfaceView?.holder?.addCallback(surfaceCallback)
             videoDecoder?.stopAsync()
             videoDecoder = VideoDecoder(
-                surface = null, surfaceView, requestMediaImage, requestYuv, requestBitmap,
+                surfaceView?.holder?.surface, null, requestMediaImage, requestYuv, requestBitmap,
                 videoMimeType, sdpInfo.videoTrack!!.frameWidth, sdpInfo.videoTrack!!.frameHeight, rotation = 0,
                 videoQueue, clientListener = clientListener
             )

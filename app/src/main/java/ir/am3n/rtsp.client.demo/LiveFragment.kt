@@ -185,7 +185,7 @@ class LiveFragment : Fragment() {
                 //binding.rsv.start(playVideo = true, playAudio = true)
 
                 rtsp.init(liveViewModel.rtspRequest.value!!, timeout = 2_000)
-                rtsp.start(playVideo = true, playAudio = false)
+                rtsp.start(playVideo = true, playAudio = true)
 
             }
         }
@@ -195,10 +195,10 @@ class LiveFragment : Fragment() {
 
         rtsp.setSurfaceView(binding.svVideo)
 
-        rtsp.setRequestMediaImage(true)
-        rtsp.setRequestYuv(true)
-        rtsp.setRequestBitmap(true)
-        rtsp.setRequestAudioSample(true)
+        rtsp.setRequestMediaImage(false)
+        rtsp.setRequestYuv(false)
+        rtsp.setRequestBitmap(false)
+        rtsp.setRequestAudioSample(false)
 
         return binding.root
     }

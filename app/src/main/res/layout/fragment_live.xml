@@ -84,12 +84,12 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
 
-        <ir.am3n.rtsp.client.widget.RtspSurfaceView
-            android:id="@+id/rsv"
-            android:layout_width="match_parent"
-            android:layout_height="250dp"
-            android:layout_below="@+id/svVideo"
-            android:layout_marginTop="8dp" />
+<!--        <ir.am3n.rtsp.client.widget.RtspSurfaceView-->
+<!--            android:id="@+id/rsv"-->
+<!--            android:layout_width="match_parent"-->
+<!--            android:layout_height="250dp"-->
+<!--            android:layout_below="@+id/svVideo"-->
+<!--            android:layout_marginTop="8dp" />-->
 
     </RelativeLayout>
 
