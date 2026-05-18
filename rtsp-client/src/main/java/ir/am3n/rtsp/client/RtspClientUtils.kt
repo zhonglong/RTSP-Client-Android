@@ -16,18 +16,22 @@ import ir.am3n.rtsp.client.interfaces.RtspClientListener
 import ir.am3n.rtsp.client.parser.AacParser
 import ir.am3n.rtsp.client.parser.RtpParser
 import ir.am3n.rtsp.client.parser.VideoRtpParser
-import ir.am3n.utils.VideoCodecUtils
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.math.BigInteger
-import java.net.DatagramPacket
+import java.net.Inet4Address
 import java.net.InetAddress
-import java.net.MulticastSocket
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.net.StandardSocketOptions
+import java.nio.ByteBuffer
+import java.nio.channels.DatagramChannel
+import java.nio.channels.SelectionKey
+import java.nio.channels.Selector
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.*
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 
 
@@ -114,10 +118,32 @@ internal object RtspClientUtils {
         keepAliveListener: RtspClientKeepAliveListener
     ) {
 
-        var count = 0
+        val data = ByteArray(MTU) // Usually not bigger than MTU = 15KB
+        val buffer = ByteArray(MTU)
+        val ni = NetworkInterface.getNetworkInterfaces()
+            .asSequence()
+            .firstOrNull { ni ->
+                (ni.name == "eth0" || ni.name == "wlan0") &&
+                        ni.isUp &&
+                        !ni.isLoopback &&
+                        ni.inetAddresses.asSequence().any { it is Inet4Address && !it.isLoopbackAddress }
+            }
+        val selector = Selector.open()
+        var video: DatagramChannel? = null
+        var audio: DatagramChannel? = null
+
         val videoParser: VideoRtpParser? =
             if (sdpInfo.videoTrack != null) {
-                count++
+                video = DatagramChannel.open()
+                video.setOption(StandardSocketOptions.SO_REUSEADDR, true)
+                video.setOption(StandardSocketOptions.SO_RCVBUF, 1024 * 1024)
+                video.bind(InetSocketAddress(sdpInfo.videoTrack!!.port))
+                video.setOption(StandardSocketOptions.IP_MULTICAST_IF, ni)
+                video.setOption(StandardSocketOptions.IP_MULTICAST_LOOP, false)
+                video.join(InetAddress.getByName(sdpInfo.videoTrack!!.host), ni)
+                video.configureBlocking(false)
+                video.register(selector, SelectionKey.OP_READ)
+
                 when (sdpInfo.videoTrack!!.videoCodec) {
                     VIDEO_CODEC_H264 -> VideoRtpParser()
                     VIDEO_CODEC_H265 -> VideoRtpParser()
@@ -126,75 +152,51 @@ internal object RtspClientUtils {
             } else null
         val audioParser =
             if (sdpInfo.audioTrack != null) {
-                count++
+                audio = DatagramChannel.open()
+                audio.setOption(StandardSocketOptions.SO_REUSEADDR, true)
+                audio.bind(InetSocketAddress(sdpInfo.audioTrack!!.port))
+                audio.setOption(StandardSocketOptions.IP_MULTICAST_IF, ni)
+                audio.setOption(StandardSocketOptions.IP_MULTICAST_LOOP, false)
+                audio.join(InetAddress.getByName(sdpInfo.audioTrack!!.host), ni)
+                audio.configureBlocking(false)
+                audio.register(selector, SelectionKey.OP_READ)
+
                 if (sdpInfo.audioTrack?.audioCodec == AUDIO_CODEC_AAC) AacParser(sdpInfo.audioTrack!!.mode!!) else null
             } else null
 
-        if (!exitFlag.get()) {
-            val cdl = CountDownLatch(count)
-            // Audio
-            if (sdpInfo.videoTrack != null) {
-                Thread({
-                    var videoSeqNum = 0
+        var videoSeqNum = 0
+        while (!exitFlag.get()) {
+            if (selector.select(5000) <= 0) break
+            for (key in selector.selectedKeys()) {
+                if (key.isReadable()) {
+                    val channel = key.channel() as DatagramChannel
+                    val byteBuffer = ByteBuffer.wrap(buffer)
+                    channel.receive(byteBuffer)
+                    byteBuffer.flip()
 
-                    val socket = MulticastSocket(sdpInfo.videoTrack!!.port)
-                    socket.receiveBufferSize = 1024 * 1024
-                    val group = InetAddress.getByName(sdpInfo.videoTrack!!.host)
-                    socket.joinGroup(group)
-
-                    val data = ByteArray(MTU) // Usually not bigger than MTU = 15KB
-                    val buffer = ByteArray(MTU)
-                    val packet = DatagramPacket(buffer, buffer.size)
-
-                    while (!exitFlag.get()) {
-                        socket.receive(packet)
-
-                        val header = RtpHeader.parseData(buffer, packet.length)!!
-                        System.arraycopy(buffer, RtpParser.RTP_HEADER_SIZE, data, 0, header.payloadSize)
-                        if (header.payloadType == sdpInfo.videoTrack?.payloadType) {
-                            if ((Q + header.sequenceNumber - videoSeqNum) % Q != 1)
-                                Log.w(RtspClient.TAG, "Invalid video seq num " + videoSeqNum + "/" + header.sequenceNumber)
-                            videoSeqNum = header.sequenceNumber
-                            val nalUnit = videoParser?.processRtpPacketAndGetNalUnit(data, header.payloadSize)
-                            if (nalUnit != null) {
-                                listener.onRtspVideoNalUnitReceived(nalUnit, 0, nalUnit.size, (header.timeStamp * 11.111111).toLong())
-                            }
+                    val header = RtpHeader.parseData(buffer, byteBuffer.remaining())!!
+                    System.arraycopy(buffer, RtpParser.RTP_HEADER_SIZE, data, 0, header.payloadSize)
+                    if (header.payloadType == sdpInfo.videoTrack?.payloadType) {
+                        if ((Q + header.sequenceNumber - videoSeqNum) % Q != 1)
+                            Log.w(RtspClient.TAG, "Invalid video seq num " + videoSeqNum + "/" + header.sequenceNumber)
+                        videoSeqNum = header.sequenceNumber
+                        val nalUnit = videoParser?.processRtpPacketAndGetNalUnit(data, header.payloadSize)
+                        if (nalUnit != null) {
+                            listener.onRtspVideoNalUnitReceived(nalUnit, 0, nalUnit.size, (header.timeStamp * 11.111111).toLong())
+                        }
+                    } else if (header.payloadType == sdpInfo.audioTrack?.payloadType) {
+                        val sample = audioParser?.processRtpPacketAndGetSample(data, header.payloadSize)
+                        if (sample != null) {
+                            listener.onRtspAudioSampleReceived(sample, offset = 0, sample.size, (header.timeStamp * 11.111111).toLong())
                         }
                     }
-                    socket.close()
-                    cdl.countDown()
-                }).start()
+                }
             }
-
-            // Audio
-            if (sdpInfo.audioTrack != null) {
-                Thread({
-                    val socket = MulticastSocket(sdpInfo.audioTrack!!.port)
-                    val group = InetAddress.getByName(sdpInfo.audioTrack!!.host)
-                    socket.joinGroup(group)
-
-                    val data = ByteArray(MTU) // Usually not bigger than MTU = 15KB
-                    val buffer = ByteArray(MTU)
-                    val packet = DatagramPacket(buffer, buffer.size)
-
-                    while (!exitFlag.get()) {
-                        socket.receive(packet)
-
-                        val header = RtpHeader.parseData(buffer, packet.length)!!
-                        System.arraycopy(buffer, RtpParser.RTP_HEADER_SIZE, data, 0, header.payloadSize)
-                        if (header.payloadType == sdpInfo.audioTrack?.payloadType) {
-                            val sample = audioParser?.processRtpPacketAndGetSample(data, header.payloadSize)
-                            if (sample != null) {
-                                listener.onRtspAudioSampleReceived(sample, offset = 0, sample.size, (header.timeStamp * 11.111111).toLong())
-                            }
-                        }
-                    }
-                    socket.close()
-                    cdl.countDown()
-                }).start()
-            }
-            cdl.await()
+            selector.selectedKeys().clear()
         }
+        video?.close()
+        audio?.close()
+        selector.close()
     }
 
     @Throws(IOException::class)

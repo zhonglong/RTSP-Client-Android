@@ -91,19 +91,19 @@ class LiveFragment : Fragment() {
         }
 
         private fun onError() {
-            if (disconnectCount < 3) {
-                rtsp.start()
-            } else {
-                val timeout = when (disconnectCount) {
-                    in 3..6 -> 1000L
-                    in 7..10 -> 3000L
-                    else -> 5000L
-                }
-                CoroutineScope(Dispatchers.IO).launch {
-                    delay(timeout)
-                    rtsp.start()
-                }
-            }
+//            if (disconnectCount < 3) {
+//                rtsp.start()
+//            } else {
+//                val timeout = when (disconnectCount) {
+//                    in 3..6 -> 1000L
+//                    in 7..10 -> 3000L
+//                    else -> 5000L
+//                }
+//                CoroutineScope(Dispatchers.IO).launch {
+//                    delay(timeout)
+//                    rtsp.start()
+//                }
+//            }
         }
 
     }
